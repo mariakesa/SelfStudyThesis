@@ -330,6 +330,27 @@ def run_loo_decoder_all_neurons(X, y, decoder_name: str = "all_neurons"):
     probs = np.zeros(n, dtype=np.float64)
     preds = np.zeros(n, dtype=np.int64)
 
+    # One model is fitted per LOO fold, so there is not just one weight vector.
+    # Rows correspond to held-out images; columns correspond to cleaned neurons.
+    #
+    # standardized weights:
+    #     coefficients acting on StandardScaler-transformed activity
+    #
+    # raw weights:
+    #     equivalent coefficients acting directly on the original activity
+    #
+    # heldout_evidence:
+    #     per-neuron contribution to the held-out image's logit:
+    #         evidence[test_idx, neuron] = z_scored_activity * standardized_weight
+    #     Therefore:
+    #         heldout_evidence[test_idx].sum() + loo_bias_standardized[test_idx]
+    #         == logits[test_idx]
+    loo_weights_standardized = np.zeros((n, d), dtype=np.float32)
+    loo_weights_raw = np.zeros((n, d), dtype=np.float32)
+    loo_bias_standardized = np.zeros(n, dtype=np.float64)
+    loo_bias_raw = np.zeros(n, dtype=np.float64)
+    heldout_evidence = np.zeros((n, d), dtype=np.float32)
+
     print()
     print("#" * 80)
     print(f"Running LOO Adam decoder: {decoder_name}")
@@ -350,9 +371,6 @@ def run_loo_decoder_all_neurons(X, y, decoder_name: str = "all_neurons"):
         X_train = scaler.fit_transform(X_train_raw)
         X_test = scaler.transform(X_test_raw)
 
-        X_train= X_train_raw
-        X_test = X_test_raw
-
         w, b = fit_adam_logistic(
             X_train,
             y_train,
@@ -362,7 +380,30 @@ def run_loo_decoder_all_neurons(X, y, decoder_name: str = "all_neurons"):
             seed=10_000 + test_idx,
         )
 
-        logit = float(X_test[0] @ w + b)
+        # Save the fold-specific decoder axis.
+        loo_weights_standardized[test_idx] = w.astype(np.float32)
+        loo_bias_standardized[test_idx] = b
+
+        # Convert the standardized-space model back to the original activity
+        # units. For z = (x - mean) / scale:
+        #
+        #     z @ w + b = x @ (w / scale) + [b - mean @ (w / scale)]
+        #
+        # StandardScaler protects zero-variance columns by using scale=1, but
+        # such columns were already removed above.
+        w_raw = w / scaler.scale_
+        b_raw = float(b - scaler.mean_ @ w_raw)
+
+        loo_weights_raw[test_idx] = w_raw.astype(np.float32)
+        loo_bias_raw[test_idx] = b_raw
+
+        # Signed evidence contributed by every neuron for this held-out image.
+        # Positive values push toward "animal"; negative values push toward
+        # "non-animal".
+        evidence = X_test[0] * w
+        heldout_evidence[test_idx] = evidence.astype(np.float32)
+
+        logit = float(evidence.sum() + b)
         prob = float(sigmoid_np(logit))
         pred = int(prob >= 0.5)
 
@@ -403,6 +444,33 @@ def run_loo_decoder_all_neurons(X, y, decoder_name: str = "all_neurons"):
     print("Confusion matrix rows=true [non-animal, animal], cols=pred [non-animal, animal]:")
     print(cm)
 
+    # Also fit one descriptive model on the complete labeled dataset. This is
+    # useful as a single population axis for plotting and interpretation.
+    # It is NOT used to compute the cross-validated performance above.
+    full_scaler = StandardScaler()
+    X_full_standardized = full_scaler.fit_transform(X)
+
+    full_w_standardized, full_b_standardized = fit_adam_logistic(
+        X_full_standardized,
+        y,
+        lr=LR,
+        weight_decay=WEIGHT_DECAY,
+        epochs=EPOCHS,
+        seed=RANDOM_SEED,
+    )
+
+    full_w_raw = full_w_standardized / full_scaler.scale_
+    full_b_raw = float(
+        full_b_standardized - full_scaler.mean_ @ full_w_raw
+    )
+
+    print()
+    print("Saved weight interpretation:")
+    print("  positive coefficient/evidence -> pushes toward animal")
+    print("  negative coefficient/evidence -> pushes toward non-animal")
+    print("  LOO weight matrix shape:      ", loo_weights_standardized.shape)
+    print("  held-out evidence shape:      ", heldout_evidence.shape)
+
     return {
         "decoder_name": decoder_name,
         "n_features": d,
@@ -413,6 +481,27 @@ def run_loo_decoder_all_neurons(X, y, decoder_name: str = "all_neurons"):
         "balanced_accuracy": bal_acc,
         "auc": auc,
         "confusion_matrix": cm,
+
+        # Fold-specific coefficients and per-image evidence
+        "loo_weights_standardized": loo_weights_standardized,
+        "loo_weights_raw": loo_weights_raw,
+        "loo_bias_standardized": loo_bias_standardized,
+        "loo_bias_raw": loo_bias_raw,
+        "heldout_evidence": heldout_evidence,
+        "mean_loo_weight_standardized": np.mean(
+            loo_weights_standardized, axis=0
+        ).astype(np.float32),
+        "mean_abs_loo_weight_standardized": np.mean(
+            np.abs(loo_weights_standardized), axis=0
+        ).astype(np.float32),
+
+        # One descriptive model fitted to all labeled images
+        "full_weights_standardized": full_w_standardized.astype(np.float32),
+        "full_bias_standardized": full_b_standardized,
+        "full_weights_raw": full_w_raw.astype(np.float32),
+        "full_bias_raw": full_b_raw,
+        "full_scaler_mean": full_scaler.mean_.astype(np.float32),
+        "full_scaler_scale": full_scaler.scale_.astype(np.float32),
     }
 
 
@@ -461,6 +550,33 @@ def main():
         balanced_accuracy=result["balanced_accuracy"],
         auc=result["auc"],
         confusion_matrix=result["confusion_matrix"],
+
+        # Fold-specific decoder weights.
+        # Axis 0 = held-out image/fold; axis 1 = cleaned neuron.
+        loo_weights_standardized=result["loo_weights_standardized"],
+        loo_weights_raw=result["loo_weights_raw"],
+        loo_bias_standardized=result["loo_bias_standardized"],
+        loo_bias_raw=result["loo_bias_raw"],
+
+        # Per-neuron signed contribution to each held-out image's logit.
+        # Positive evidence favors animal; negative evidence favors non-animal.
+        heldout_evidence=result["heldout_evidence"],
+
+        # Across-fold summaries for ranking neurons.
+        mean_loo_weight_standardized=result["mean_loo_weight_standardized"],
+        mean_abs_loo_weight_standardized=result[
+            "mean_abs_loo_weight_standardized"
+        ],
+
+        # One descriptive model fitted to all labeled images.
+        # This model is convenient for a single interpretable population axis,
+        # but it is not used for the LOO performance estimates.
+        full_weights_standardized=result["full_weights_standardized"],
+        full_bias_standardized=result["full_bias_standardized"],
+        full_weights_raw=result["full_weights_raw"],
+        full_bias_raw=result["full_bias_raw"],
+        full_scaler_mean=result["full_scaler_mean"],
+        full_scaler_scale=result["full_scaler_scale"],
 
         # Settings
         lr=LR,

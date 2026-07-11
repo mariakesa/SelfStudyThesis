@@ -1,0 +1,4 @@
+/home/maria/Documents/HuggingMouseData/MouseViTEmbeddings/google_vit-base-patch16-224_embeddings_logits.pkl
+Using goal-driven deep learning models to understand
+sensory cortex
+Daniel L K Yamins1,2 & James J DiCarlo1,2

@@ -295,7 +295,515 @@ def basic_entrywise_metrics(X_original_ni, X_synth_ni, labels, neuron_metadata):
 
 
 def run_pca_comparison(X_original_ni, X_synth_ni, labels):
-    """Compare real and synthetic PCA geometry."""
+    """Compare real and synthetic#!/usr/bin/env python3
+"""
+Cross-validated four-class encoding regression.
+
+Question:
+    Can image class labels predict held-out neural responses?
+
+For each held-out image:
+    1. Fit regression on all other images.
+    2. Predict the held-out image's response for every neuron.
+    3. Store prediction.
+
+Then compute cross-validated R^2 per neuron.
+
+This is a proper test-set metric across images.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score
+from sklearn.model_selection import LeaveOneOut, KFold
+
+
+# =============================================================================
+# Paths
+# =============================================================================
+
+COMPOSITE_PATH = Path(
+    "/home/maria/SelfStudyThesis/data/allen_natural_scenes_four_class_composite.npy"
+)
+
+OUT_DIR = Path("/home/maria/SelfStudyThesis/results/encoding_label_regression_cv")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+OUT_NPZ = OUT_DIR / "four_class_label_encoding_cv_r2_by_neuron.npz"
+OUT_FIG = OUT_DIR / "four_class_label_encoding_cv_r2_histogram.png"
+OUT_FIG_ZOOM = OUT_DIR / "four_class_label_encoding_cv_r2_histogram_zoom.png"
+
+
+# =============================================================================
+# Settings
+# =============================================================================
+
+CV_MODE = "loo"
+N_SPLITS = 10
+RANDOM_STATE = 123
+
+R2_THRESHOLD = 0.10
+
+
+LABEL_NAMES = {
+    -1: "unlabeled",
+     0: "animals",
+     1: "landscape",
+     2: "plant",
+     3: "man-made object",
+}
+
+
+# =============================================================================
+# Loading
+# =============================================================================
+
+def load_composite_data():
+    print()
+    print("#" * 80)
+    print("Loading composite dataset")
+    print("#" * 80)
+    print(f"Composite path: {COMPOSITE_PATH}")
+
+    data = np.load(COMPOSITE_PATH, allow_pickle=True).item()
+
+    X = np.asarray(data["X"], dtype=np.float64)
+    stimulus_metadata = data["stimulus_metadata"]
+    neuron_metadata = data["neuron_metadata"]
+
+    labels = np.asarray(stimulus_metadata["label"], dtype=np.int64).ravel()
+
+    print()
+    print("=" * 80)
+    print("Raw composite contents")
+    print("=" * 80)
+    print(f"X raw shape:       {X.shape}")
+    print(f"labels shape:      {labels.shape}")
+    print(f"neuron metadata keys:   {list(neuron_metadata.keys())}")
+    print(f"stimulus metadata keys: {list(stimulus_metadata.keys())}")
+
+    print()
+    print("Raw four-class label counts:")
+    unique, counts = np.unique(labels, return_counts=True)
+    for value, count in zip(unique, counts):
+        name = LABEL_NAMES.get(int(value), "UNKNOWN")
+        print(f"  {int(value):>2} = {name:<16} n={int(count)}")
+
+    # Composite X may be neurons × images.
+    # Encoding model expects images × neurons.
+    if X.shape[1] == len(labels):
+        print()
+        print("[INFO] Transposing X from neurons × images to images × neurons.")
+        X = X.T
+    elif X.shape[0] == len(labels):
+        print()
+        print("[INFO] X already appears to be images × neurons.")
+    else:
+        raise ValueError(
+            f"Cannot align X with labels. X={X.shape}, labels={labels.shape}. "
+            "Expected one X axis to match number of image labels."
+        )
+
+    n_features = X.shape[1]
+
+    if "brain_area" in neuron_metadata:
+        brain_area = np.asarray(neuron_metadata["brain_area"], dtype=object).ravel()
+    else:
+        brain_area = np.full(n_features, "unknown", dtype=object)
+
+    if "cell_specimen_id" in neuron_metadata:
+        cell_specimen_id = np.asarray(
+            neuron_metadata["cell_specimen_id"], dtype=np.int64
+        ).ravel()
+    else:
+        cell_specimen_id = np.full(n_features, -1, dtype=np.int64)
+
+    if "ophys_experiment_id" in neuron_metadata:
+        ophys_experiment_id = np.asarray(
+            neuron_metadata["ophys_experiment_id"], dtype=np.int64
+        ).ravel()
+    else:
+        ophys_experiment_id = np.full(n_features, -1, dtype=np.int64)
+
+    if len(brain_area) != n_features:
+        raise ValueError(
+            f"brain_area length does not match feature count. "
+            f"brain_area={len(brain_area)}, features={n_features}"
+        )
+
+    if len(cell_specimen_id) != n_features:
+        raise ValueError(
+            f"cell_specimen_id length does not match feature count. "
+            f"cell_specimen_id={len(cell_specimen_id)}, features={n_features}"
+        )
+
+    if len(ophys_experiment_id) != n_features:
+        raise ValueError(
+            f"ophys_experiment_id length does not match feature count. "
+            f"ophys_experiment_id={len(ophys_experiment_id)}, features={n_features}"
+        )
+
+    print()
+    print("=" * 80)
+    print("After orientation alignment")
+    print("=" * 80)
+    print(f"X shape, images × neurons: {X.shape}")
+    print(f"Number of neurons/features: {n_features}")
+
+    return data, X, labels, brain_area, cell_specimen_id, ophys_experiment_id
+
+
+# =============================================================================
+# Design matrix
+# =============================================================================
+
+def make_one_hot_design(labels):
+    """
+    Make one-hot design from four-class labels.
+
+    Drops unlabeled images, label == -1.
+
+    Design has 4 columns and no explicit intercept:
+        animals, landscape, plant, man-made object
+
+    With no intercept, each coefficient is just the class mean response.
+    This is especially clean for cross-validation.
+    """
+
+    keep_mask = labels >= 0
+    labels_kept = labels[keep_mask]
+
+    classes = np.array([0, 1, 2, 3], dtype=np.int64)
+
+    design = np.zeros((len(labels_kept), len(classes)), dtype=np.float64)
+
+    for j, cls in enumerate(classes):
+        design[:, j] = labels_kept == cls
+
+    column_names = [LABEL_NAMES[int(c)] for c in classes]
+
+    return design, labels_kept, keep_mask, classes, column_names
+
+
+# =============================================================================
+# CV encoding
+# =============================================================================
+
+def get_cv_splitter(n_samples):
+    if CV_MODE == "loo":
+        print()
+        print("[INFO] Using Leave-One-Out CV")
+        return LeaveOneOut()
+
+    if CV_MODE == "kfold":
+        print()
+        print(f"[INFO] Using KFold CV, n_splits={N_SPLITS}")
+        return KFold(
+            n_splits=N_SPLITS,
+            shuffle=True,
+            random_state=RANDOM_STATE,
+        )
+
+    raise ValueError(f"Unknown CV_MODE: {CV_MODE}")
+
+
+def cross_validated_encoding(X, design, labels_kept):
+    """
+    Fit encoding model on train images and predict held-out images.
+
+    X:
+        images × neurons
+
+    design:
+        images × classes
+
+    Returns:
+        y_pred_cv:
+            images × neurons
+
+        fold_id:
+            fold assignment per image
+    """
+
+    n_images, n_neurons = X.shape
+
+    y_pred_cv = np.full_like(X, np.nan, dtype=np.float64)
+    fold_id = np.full(n_images, -1, dtype=np.int64)
+
+    splitter = get_cv_splitter(n_images)
+
+    print()
+    print("#" * 80)
+    print("Running cross-validated encoding")
+    print("#" * 80)
+    print(f"Images:  {n_images}")
+    print(f"Neurons: {n_neurons}")
+    print(f"Design:  {design.shape}")
+
+    for fold, (train_idx, test_idx) in enumerate(splitter.split(design), start=1):
+        X_train = X[train_idx]
+        X_test = X[test_idx]
+
+        D_train = design[train_idx]
+        D_test = design[test_idx]
+
+        # Sanity check for LOO:
+        # each train split should contain at least one example from every class.
+        train_labels = labels_kept[train_idx]
+        missing_classes = sorted(set([0, 1, 2, 3]) - set(train_labels.tolist()))
+        if missing_classes:
+            raise ValueError(
+                f"Fold {fold} has missing classes in training data: {missing_classes}. "
+                "Use KFold or check labels."
+            )
+
+        model = LinearRegression(fit_intercept=False)
+        model.fit(D_train, X_train)
+
+        y_pred_cv[test_idx] = model.predict(D_test)
+        fold_id[test_idx] = fold
+
+        if fold == 1 or fold % 10 == 0 or fold == n_images:
+            print(
+                f"[fold {fold:>3}] "
+                f"train={len(train_idx):>3} "
+                f"test={len(test_idx):>3}"
+            )
+
+    if np.isnan(y_pred_cv).any():
+        raise RuntimeError("Some CV predictions are still NaN. Something went wrong.")
+
+    return y_pred_cv, fold_id
+
+
+def compute_cv_r2(X, y_pred_cv):
+    """
+    Compute cross-validated R^2 per neuron.
+
+    R^2 can be negative.
+
+    Negative CV R^2 means:
+        class-label prediction is worse than predicting the neuron's global mean.
+    """
+
+    r2_cv = r2_score(X, y_pred_cv, multioutput="raw_values")
+
+    # Also compute manually, to make the meaning explicit.
+    y_mean = np.mean(X, axis=0, keepdims=True)
+
+    ss_res = np.sum((X - y_pred_cv) ** 2, axis=0)
+    ss_tot = np.sum((X - y_mean) ** 2, axis=0)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r2_manual = 1.0 - ss_res / ss_tot
+
+    if not np.allclose(r2_cv, r2_manual, equal_nan=True):
+        print("[WARNING] sklearn and manual R^2 do not exactly match.")
+
+    return r2_cv
+
+
+# =============================================================================
+# Summaries and plots
+# =============================================================================
+
+def summarize_r2(r2, brain_area, title):
+    finite = np.isfinite(r2)
+    vals = r2[finite]
+
+    print()
+    print("=" * 80)
+    print(title)
+    print("=" * 80)
+
+    print(f"Finite neurons:        {finite.sum()} / {len(r2)}")
+    print(f"Mean CV R^2:           {np.mean(vals):.6f}")
+    print(f"Median CV R^2:         {np.median(vals):.6f}")
+    print(f"Std CV R^2:            {np.std(vals):.6f}")
+    print(f"Min CV R^2:            {np.min(vals):.6f}")
+    print(f"Max CV R^2:            {np.max(vals):.6f}")
+    print(f"Neurons CV R^2 > 0:    {np.sum(vals > 0)}")
+    print(f"Neurons CV R^2 > 0.01: {np.sum(vals > 0.01)}")
+    print(f"Neurons CV R^2 > 0.05: {np.sum(vals > 0.05)}")
+    print(f"Neurons CV R^2 > 0.10: {np.sum(vals > 0.10)}")
+    print(f"Percent CV R^2 > 0.10: {100 * np.sum(vals > 0.10) / len(vals):.3f}%")
+
+    print()
+    print("By brain area:")
+    area_str = brain_area.astype(str)
+
+    for area in sorted(np.unique(area_str)):
+        mask = (area_str == area) & finite
+        area_vals = r2[mask]
+
+        if len(area_vals) == 0:
+            continue
+
+        print(
+            f"  {area:<8} "
+            f"n={len(area_vals):>6} "
+            f"mean={np.mean(area_vals):>9.6f} "
+            f"median={np.median(area_vals):>9.6f} "
+            f"max={np.max(area_vals):>9.6f} "
+            f"n>0.10={np.sum(area_vals > 0.10):>5}"
+        )
+
+
+def plot_histogram(r2_cv):
+    finite = np.isfinite(r2_cv)
+    vals = r2_cv[finite]
+
+    plt.figure(figsize=(8, 5))
+    plt.hist(vals, bins=100)
+    plt.axvline(0.0, linestyle="-", label="zero")
+    plt.axvline(np.mean(vals), linestyle="--", label=f"mean = {np.mean(vals):.4f}")
+    plt.axvline(np.median(vals), linestyle=":", label=f"median = {np.median(vals):.4f}")
+    plt.axvline(R2_THRESHOLD, linestyle="-.", label=f"threshold = {R2_THRESHOLD}")
+    plt.xlabel("Cross-validated variance explained per neuron, $R^2$")
+    plt.ylabel("Number of neurons")
+    plt.title("CV encoding model: four-class image-label design matrix")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(OUT_FIG, dpi=200)
+    plt.close()
+
+    print()
+    print(f"Saved histogram to: {OUT_FIG}")
+
+
+def plot_histogram_zoom(r2_cv):
+    finite = np.isfinite(r2_cv)
+    vals = r2_cv[finite]
+
+    plt.figure(figsize=(8, 5))
+    plt.hist(vals, bins=100, range=(-0.2, 0.2))
+    plt.axvline(0.0, linestyle="-", label="zero")
+    plt.axvline(np.mean(vals), linestyle="--", label=f"mean = {np.mean(vals):.4f}")
+    plt.axvline(np.median(vals), linestyle=":", label=f"median = {np.median(vals):.4f}")
+    plt.axvline(R2_THRESHOLD, linestyle="-.", label=f"threshold = {R2_THRESHOLD}")
+    plt.xlabel("Cross-validated variance explained per neuron, $R^2$")
+    plt.ylabel("Number of neurons")
+    plt.title("CV encoding model histogram, zoomed")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(OUT_FIG_ZOOM, dpi=200)
+    plt.close()
+
+    print(f"Saved zoomed histogram to: {OUT_FIG_ZOOM}")
+
+
+def print_top_neurons(r2_cv, brain_area, cell_specimen_id, ophys_experiment_id, n_top=30):
+    finite = np.isfinite(r2_cv)
+    finite_indices = np.where(finite)[0]
+
+    order = finite_indices[np.argsort(r2_cv[finite_indices])[::-1]]
+
+    print()
+    print("=" * 80)
+    print(f"Top {n_top} neurons by cross-validated R^2")
+    print("=" * 80)
+
+    for rank, idx in enumerate(order[:n_top], start=1):
+        print(
+            f"{rank:>2}. "
+            f"neuron_idx={idx:>6} "
+            f"CV_R2={r2_cv[idx]:>9.5f} "
+            f"area={str(brain_area[idx]):<8} "
+            f"cell_specimen_id={int(cell_specimen_id[idx])} "
+            f"ophys_experiment_id={int(ophys_experiment_id[idx])}"
+        )
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main():
+    (
+        data,
+        X,
+        labels,
+        brain_area,
+        cell_specimen_id,
+        ophys_experiment_id,
+    ) = load_composite_data()
+
+    design, labels_kept, keep_mask, classes, column_names = make_one_hot_design(labels)
+
+    X_kept = X[keep_mask]
+
+    print()
+    print("=" * 80)
+    print("CV design matrix")
+    print("=" * 80)
+    print(f"Kept images:    {X_kept.shape[0]} / {X.shape[0]}")
+    print(f"Design shape:   {design.shape}")
+    print(f"Design columns: {column_names}")
+
+    print()
+    print("Kept label counts:")
+    unique, counts = np.unique(labels_kept, return_counts=True)
+    for value, count in zip(unique, counts):
+        print(f"  {int(value):>2} = {LABEL_NAMES[int(value)]:<16} n={int(count)}")
+
+    y_pred_cv, fold_id = cross_validated_encoding(X_kept, design, labels_kept)
+    r2_cv = compute_cv_r2(X_kept, y_pred_cv)
+
+    summarize_r2(
+        r2_cv,
+        brain_area,
+        title="Cross-validated variance explained summary",
+    )
+
+    print_top_neurons(
+        r2_cv,
+        brain_area,
+        cell_specimen_id,
+        ophys_experiment_id,
+        n_top=30,
+    )
+
+    plot_histogram(r2_cv)
+    plot_histogram_zoom(r2_cv)
+
+    np.savez_compressed(
+        OUT_NPZ,
+        r2_cv_by_neuron=r2_cv,
+        y_pred_cv=y_pred_cv,
+        X_kept=X_kept,
+        design=design,
+        design_column_names=np.asarray(column_names, dtype=object),
+        labels=labels,
+        labels_kept=labels_kept,
+        keep_mask=keep_mask,
+        classes=classes,
+        class_names=np.asarray([LABEL_NAMES[int(c)] for c in classes], dtype=object),
+        fold_id=fold_id,
+        brain_area=brain_area,
+        cell_specimen_id=cell_specimen_id,
+        ophys_experiment_id=ophys_experiment_id,
+        cv_mode=CV_MODE,
+        n_splits=N_SPLITS,
+        random_state=RANDOM_STATE,
+        r2_threshold=R2_THRESHOLD,
+    )
+
+    print()
+    print(f"Saved CV encoding results to: {OUT_NPZ}")
+
+    print()
+    print("#" * 80)
+    print("Done")
+    print("#" * 80)
+
+
+if __name__ == "__main__":
+    main() PCA geometry."""
     X_real = X_original_ni.T   # images × neurons
     X_syn = X_synth_ni.T       # images × neurons
 

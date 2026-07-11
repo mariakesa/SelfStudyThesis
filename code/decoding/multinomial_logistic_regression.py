@@ -1,32 +1,28 @@
 #!/usr/bin/env python3
 """
-Decode animals vs all other labeled image classes using all Allen neurons.
+Four-class softmax decoder using Torch + Adam.
 
-Input composite file:
-    /home/maria/SelfStudyThesis/data/allen_natural_scenes_four_class_composite.npy
+Task:
+    Decode image label among:
+        0 = animals
+        1 = landscape
+        2 = plant
+        3 = man-made object
 
-Expected composite structure:
-    data["X"]                       total_neurons × 118
-    data["stimulus_metadata"]["label"]    118 labels
-    data["neuron_metadata"]              row-aligned neuron metadata
+Model:
+    Multiclass linear softmax regression:
+        logits = X @ W.T + b
 
-Four-class labels:
-    -1 = unlabeled
-     0 = animals
-     1 = landscape
-     2 = plant
-     3 = man-made object
+Loss:
+    CrossEntropyLoss
 
-This script:
-    1. Loads the composite file.
-    2. Transposes X to images × neurons.
-    3. Excludes unlabeled images.
-    4. Converts labels to binary:
-           1 = animals
-           0 = all other labeled classes
-    5. Removes invalid / nonconstant neurons.
-    6. Runs leave-one-out Adam logistic regression using all neurons.
-    7. Saves results to .npz.
+Evaluation:
+    Leave-one-image-out cross-validation.
+
+Uses the same Adam hyperparameters as the previous binary decoder:
+    LR = 1e-3
+    WEIGHT_DECAY = 1e-4
+    EPOCHS = 3000
 """
 
 from __future__ import annotations
@@ -40,8 +36,9 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
-    roc_auc_score,
     confusion_matrix,
+    classification_report,
+    log_loss,
 )
 
 
@@ -54,11 +51,11 @@ COMPOSITE_PATH = Path(
 )
 
 OUTDIR = Path(
-    "/home/maria/SelfStudyThesis/results/all_neurons_animals_vs_rest_adam_loo"
+    "/home/maria/SelfStudyThesis/results/all_neurons_four_class_softmax_adam_loo"
 )
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
-OUT_NPZ = OUTDIR / "all_neurons_animals_vs_rest_adam_loo_results.npz"
+OUT_NPZ = OUTDIR / "all_neurons_four_class_softmax_adam_loo_results.npz"
 
 
 # =============================================================================
@@ -72,6 +69,8 @@ EPOCHS = 3000
 RANDOM_SEED = 0
 EPS = 1e-12
 
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 
 LABEL_NAMES = {
     -1: "unlabeled",
@@ -81,15 +80,13 @@ LABEL_NAMES = {
      3: "man-made object",
 }
 
+CLASSES = np.array([0, 1, 2, 3], dtype=np.int64)
+CLASS_NAMES = [LABEL_NAMES[int(c)] for c in CLASSES]
+
 
 # =============================================================================
-# Utility
+# Loading
 # =============================================================================
-
-def sigmoid_np(z: float | np.ndarray) -> np.ndarray:
-    z = np.clip(z, -40, 40)
-    return 1.0 / (1.0 + np.exp(-z))
-
 
 def load_composite_data():
     print()
@@ -122,7 +119,7 @@ def load_composite_data():
         name = LABEL_NAMES.get(int(value), "UNKNOWN")
         print(f"  {int(value):>2} = {name:<16} n={int(count)}")
 
-    # Composite X is total_neurons × images.
+    # Composite X is usually total_neurons × images.
     # Decoder expects images × neurons/features.
     if X.shape[1] == len(labels):
         print()
@@ -186,42 +183,43 @@ def load_composite_data():
     return data, X, labels, brain_area, cell_specimen_id, ophys_experiment_id
 
 
-def prepare_binary_animals_vs_rest():
-    data, X, labels, brain_area, cell_specimen_id, ophys_experiment_id = load_composite_data()
+def prepare_four_class_dataset():
+    (
+        data,
+        X,
+        labels,
+        brain_area,
+        cell_specimen_id,
+        ophys_experiment_id,
+    ) = load_composite_data()
 
     # Exclude unlabeled images.
     labeled_mask = labels != -1
     original_indices = np.where(labeled_mask)[0]
 
     X_labeled = X[labeled_mask]
-    labels_labeled = labels[labeled_mask]
-
-    # Binary target:
-    #   1 = animals
-    #   0 = all other labeled classes
-    y = (labels_labeled == 0).astype(np.int64)
+    y = labels[labeled_mask].astype(np.int64)
 
     print()
     print("=" * 80)
-    print("Binary decoding target")
+    print("Four-class decoding target")
     print("=" * 80)
-    print("Positive class: 1 = animals")
-    print("Negative class: 0 = landscape + plant + man-made object")
-    print()
     print(f"X labeled shape: {X_labeled.shape}")
     print(f"y shape:         {y.shape}")
     print(f"Original image indices used: {original_indices.shape}")
 
     print()
     print("Four-class counts after excluding unlabeled:")
-    unique, counts = np.unique(labels_labeled, return_counts=True)
+    unique, counts = np.unique(y, return_counts=True)
     for value, count in zip(unique, counts):
         name = LABEL_NAMES.get(int(value), "UNKNOWN")
         print(f"  {int(value):>2} = {name:<16} n={int(count)}")
 
-    print()
-    print("Binary counts [non-animal, animal]:")
-    print(np.bincount(y, minlength=2))
+    # Check labels are exactly 0,1,2,3 after removing unlabeled.
+    if not np.array_equal(np.sort(np.unique(y)), CLASSES):
+        raise ValueError(
+            f"Expected labels {CLASSES.tolist()}, got {np.sort(np.unique(y)).tolist()}"
+        )
 
     # Globally remove invalid / nonconstant features while preserving metadata alignment.
     finite_cols = np.all(np.isfinite(X_labeled), axis=0)
@@ -255,7 +253,6 @@ def prepare_binary_animals_vs_rest():
         "data": data,
         "X": X_clean,
         "y": y,
-        "four_class_labels_labeled": labels_labeled,
         "labeled_mask": labeled_mask,
         "original_indices": original_indices,
         "good_cols": good_cols,
@@ -266,21 +263,22 @@ def prepare_binary_animals_vs_rest():
 
 
 # =============================================================================
-# Adam logistic regression
+# Torch softmax regression
 # =============================================================================
 
-class TorchLogisticRegression(torch.nn.Module):
-    def __init__(self, n_features: int):
+class TorchSoftmaxRegression(torch.nn.Module):
+    def __init__(self, n_features: int, n_classes: int):
         super().__init__()
-        self.linear = torch.nn.Linear(n_features, 1)
+        self.linear = torch.nn.Linear(n_features, n_classes)
 
     def forward(self, x):
         return self.linear(x)
 
 
-def fit_adam_logistic(
+def fit_adam_softmax(
     X_train,
     y_train,
+    n_classes: int,
     lr=LR,
     weight_decay=WEIGHT_DECAY,
     epochs=EPOCHS,
@@ -289,10 +287,13 @@ def fit_adam_logistic(
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    X_t = torch.tensor(X_train.astype(np.float32))
-    y_t = torch.tensor(y_train.astype(np.float32)).view(-1, 1)
+    if DEVICE == "cuda":
+        torch.cuda.manual_seed_all(seed)
 
-    model = TorchLogisticRegression(X_train.shape[1])
+    X_t = torch.tensor(X_train.astype(np.float32), device=DEVICE)
+    y_t = torch.tensor(y_train.astype(np.int64), device=DEVICE)
+
+    model = TorchSoftmaxRegression(X_train.shape[1], n_classes).to(DEVICE)
 
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -300,7 +301,7 @@ def fit_adam_logistic(
         weight_decay=weight_decay,
     )
 
-    loss_fn = torch.nn.BCEWithLogitsLoss()
+    loss_fn = torch.nn.CrossEntropyLoss()
 
     for _ in range(epochs):
         optimizer.zero_grad()
@@ -310,33 +311,49 @@ def fit_adam_logistic(
         optimizer.step()
 
     with torch.no_grad():
-        w = model.linear.weight.detach().cpu().numpy().ravel().astype(np.float64)
-        b = float(model.linear.bias.detach().cpu().numpy()[0])
+        W = model.linear.weight.detach().cpu().numpy().astype(np.float64)
+        b = model.linear.bias.detach().cpu().numpy().astype(np.float64)
 
-    return w, b
+    return W, b
+
+
+def softmax_np(logits):
+    logits = np.asarray(logits, dtype=np.float64)
+    logits = logits - np.max(logits, axis=-1, keepdims=True)
+    exp_logits = np.exp(logits)
+    return exp_logits / np.sum(exp_logits, axis=-1, keepdims=True)
 
 
 # =============================================================================
 # LOO decoder
 # =============================================================================
 
-def run_loo_decoder_all_neurons(X, y, decoder_name: str = "all_neurons"):
+def run_loo_softmax_decoder_all_neurons(X, y, decoder_name: str):
     n, d = X.shape
+    n_classes = len(CLASSES)
 
     if d == 0:
         raise ValueError("No features found after cleaning.")
 
-    logits = np.zeros(n, dtype=np.float64)
-    probs = np.zeros(n, dtype=np.float64)
+    logits = np.zeros((n, n_classes), dtype=np.float64)
+    probs = np.zeros((n, n_classes), dtype=np.float64)
     preds = np.zeros(n, dtype=np.int64)
+
+    # Optional: store fold weights.
+    # Shape: heldout_image × class × neuron
+    # float32 keeps it smaller.
+    weights_by_fold = np.zeros((n, n_classes, d), dtype=np.float32)
+    bias_by_fold = np.zeros((n, n_classes), dtype=np.float32)
 
     print()
     print("#" * 80)
-    print(f"Running LOO Adam decoder: {decoder_name}")
+    print(f"Running LOO Adam softmax decoder: {decoder_name}")
     print("#" * 80)
     print(f"X shape: {X.shape}")
-    print(f"Label counts [non-animal, animal]: {np.bincount(y, minlength=2)}")
+    print(f"Label counts: {np.bincount(y, minlength=n_classes)}")
+    print(f"Classes: {CLASS_NAMES}")
     print(f"LR={LR}, weight_decay={WEIGHT_DECAY}, epochs={EPOCHS}")
+    print(f"Device: {DEVICE}")
     print()
 
     for test_idx in range(n):
@@ -346,29 +363,38 @@ def run_loo_decoder_all_neurons(X, y, decoder_name: str = "all_neurons"):
         y_train = y[train_mask]
         X_test_raw = X[~train_mask]
 
+        missing_classes = sorted(set(CLASSES.tolist()) - set(y_train.tolist()))
+        if missing_classes:
+            raise ValueError(
+                f"LOO fold {test_idx + 1} has missing classes in training data: "
+                f"{missing_classes}"
+            )
+
+        # Train-fold-only standardization.
         scaler = StandardScaler()
         X_train = scaler.fit_transform(X_train_raw)
         X_test = scaler.transform(X_test_raw)
 
-        X_train= X_train_raw
-        X_test = X_test_raw
-
-        w, b = fit_adam_logistic(
+        W, b = fit_adam_softmax(
             X_train,
             y_train,
+            n_classes=n_classes,
             lr=LR,
             weight_decay=WEIGHT_DECAY,
             epochs=EPOCHS,
             seed=10_000 + test_idx,
         )
 
-        logit = float(X_test[0] @ w + b)
-        prob = float(sigmoid_np(logit))
-        pred = int(prob >= 0.5)
+        test_logits = X_test @ W.T + b
+        test_probs = softmax_np(test_logits)
+        pred = int(np.argmax(test_probs[0]))
 
-        logits[test_idx] = logit
-        probs[test_idx] = prob
+        logits[test_idx] = test_logits[0]
+        probs[test_idx] = test_probs[0]
         preds[test_idx] = pred
+
+        weights_by_fold[test_idx] = W.astype(np.float32)
+        bias_by_fold[test_idx] = b.astype(np.float32)
 
         running_acc = accuracy_score(y[: test_idx + 1], preds[: test_idx + 1])
         running_bal_acc = balanced_accuracy_score(
@@ -376,20 +402,24 @@ def run_loo_decoder_all_neurons(X, y, decoder_name: str = "all_neurons"):
             preds[: test_idx + 1],
         )
 
+        true_prob = float(test_probs[0, y[test_idx]])
+
         print(
             f"[{decoder_name} LOO {test_idx + 1:03d}/{n}] "
             f"true={y[test_idx]} "
-            f"logit={logit:+.6f} "
-            f"prob={prob:.4f} "
             f"pred={pred} "
+            f"p_true={true_prob:.4f} "
+            f"p={np.round(test_probs[0], 3).tolist()} "
             f"running_acc={running_acc:.4f} "
             f"running_bal_acc={running_bal_acc:.4f}"
         )
 
     acc = accuracy_score(y, preds)
     bal_acc = balanced_accuracy_score(y, preds)
-    auc = roc_auc_score(y, probs)
-    cm = confusion_matrix(y, preds, labels=[0, 1])
+    cm = confusion_matrix(y, preds, labels=CLASSES)
+
+    # Multiclass negative log loss using held-out probabilities.
+    nll = log_loss(y, probs, labels=CLASSES)
 
     print()
     print("=" * 80)
@@ -398,10 +428,33 @@ def run_loo_decoder_all_neurons(X, y, decoder_name: str = "all_neurons"):
     print(f"Features / neurons: {d}")
     print(f"Accuracy:           {acc:.4f}")
     print(f"Balanced accuracy:  {bal_acc:.4f}")
-    print(f"AUC:                {auc:.4f}")
+    print(f"Log loss:           {nll:.4f}")
+
     print()
-    print("Confusion matrix rows=true [non-animal, animal], cols=pred [non-animal, animal]:")
+    print("Confusion matrix rows=true, cols=pred:")
+    print("Labels:", CLASS_NAMES)
     print(cm)
+
+    print()
+    print("Classification report:")
+    print(
+        classification_report(
+            y,
+            preds,
+            labels=CLASSES,
+            target_names=CLASS_NAMES,
+            digits=4,
+            zero_division=0,
+        )
+    )
+
+    print()
+    print("Mean held-out probability assigned to true class:")
+    true_probs = probs[np.arange(n), y]
+    print(f"Mean:   {np.mean(true_probs):.6f}")
+    print(f"Median: {np.median(true_probs):.6f}")
+    print(f"Min:    {np.min(true_probs):.6f}")
+    print(f"Max:    {np.max(true_probs):.6f}")
 
     return {
         "decoder_name": decoder_name,
@@ -409,10 +462,13 @@ def run_loo_decoder_all_neurons(X, y, decoder_name: str = "all_neurons"):
         "logits": logits,
         "probs": probs,
         "preds": preds,
+        "weights_by_fold": weights_by_fold,
+        "bias_by_fold": bias_by_fold,
         "accuracy": acc,
         "balanced_accuracy": bal_acc,
-        "auc": auc,
+        "log_loss": nll,
         "confusion_matrix": cm,
+        "true_probs": true_probs,
     }
 
 
@@ -423,18 +479,18 @@ def run_loo_decoder_all_neurons(X, y, decoder_name: str = "all_neurons"):
 def main():
     print()
     print("#" * 80)
-    print("Animals vs rest Adam logistic LOO decoder — all neurons")
+    print("Four-class Adam softmax LOO decoder — all neurons")
     print("#" * 80)
 
-    prepared = prepare_binary_animals_vs_rest()
+    prepared = prepare_four_class_dataset()
 
     X = prepared["X"]
     y = prepared["y"]
 
-    result = run_loo_decoder_all_neurons(
+    result = run_loo_softmax_decoder_all_neurons(
         X,
         y,
-        decoder_name="animals_vs_rest_all_neurons",
+        decoder_name="four_class_softmax_all_neurons",
     )
 
     np.savez_compressed(
@@ -442,7 +498,6 @@ def main():
 
         # Data alignment
         y=y,
-        four_class_labels_labeled=prepared["four_class_labels_labeled"],
         labeled_mask=prepared["labeled_mask"],
         original_indices=prepared["original_indices"],
         good_cols=prepared["good_cols"],
@@ -457,10 +512,13 @@ def main():
         logits=result["logits"],
         probs=result["probs"],
         preds=result["preds"],
+        weights_by_fold=result["weights_by_fold"],
+        bias_by_fold=result["bias_by_fold"],
         accuracy=result["accuracy"],
         balanced_accuracy=result["balanced_accuracy"],
-        auc=result["auc"],
+        log_loss=result["log_loss"],
         confusion_matrix=result["confusion_matrix"],
+        true_probs=result["true_probs"],
 
         # Settings
         lr=LR,
@@ -468,11 +526,11 @@ def main():
         epochs=EPOCHS,
         random_seed=RANDOM_SEED,
         eps=EPS,
+        device=DEVICE,
 
         # Labels
-        positive_class_label=0,
-        positive_class_name="animals",
-        negative_class_name="landscape + plant + man-made object",
+        classes=CLASSES,
+        class_names=np.asarray(CLASS_NAMES, dtype=object),
     )
 
     print()
