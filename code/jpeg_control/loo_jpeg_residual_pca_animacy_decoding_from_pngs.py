@@ -18,7 +18,7 @@ The script reports:
   - best observed PCA dimensionality
   - results at k=60, when requested
 
-It also saves a cross-fitted residual matrix in which every row was produced
+It also saves a crossthe nullspace hasn’t vanished from the original data geometry; we’ve excluded it from the model​the nullspace hasn’t vanished from the original data geometry; we’ve excluded it from the model​-fitted residual matrix in which every row was produced
 without using that row to fit the JPEG residualization model.
 
 Default neural data path:

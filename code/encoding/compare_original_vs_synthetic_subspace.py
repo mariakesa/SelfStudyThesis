@@ -588,7 +588,7 @@ def compute_cv_r2(X, y_pred_cv):
     R^2 can be negative.
 
     Negative CV R^2 means:
-        class-label prediction is worse than predicting the neuron's global mean.
+    class-label prediction is worse than predicting the neuron's global mean.
     """
 
     r2_cv = r2_score(X, y_pred_cv, multioutput="raw_values")

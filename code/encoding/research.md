@@ -21,3 +21,5 @@ contrastive PCA:
     C_synthetic - alpha * C_real
     
 https://chatgpt.com/g/g-p-6a40138926d08191a609eb40d7043401-writingthesis/c/6a440738-295c-83ed-8f6d-36201de1e2b1
+
+The intended_... script is what we want. 

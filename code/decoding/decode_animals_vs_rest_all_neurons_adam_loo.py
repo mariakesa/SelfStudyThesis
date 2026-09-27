@@ -350,8 +350,8 @@ def run_loo_decoder_all_neurons(X, y, decoder_name: str = "all_neurons"):
         X_train = scaler.fit_transform(X_train_raw)
         X_test = scaler.transform(X_test_raw)
 
-        X_train= X_train_raw
-        X_test = X_test_raw
+        #X_train= X_train_raw
+        #X_test = X_test_raw
 
         w, b = fit_adam_logistic(
             X_train,

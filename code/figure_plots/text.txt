@@ -1,0 +1,9 @@
+python /mnt/data/random_vs_synthetic_pca_3d_morph_with_thumbnails.py \
+  --thumbnail-url-prefix /home/maria/mariakesa.github.io/thesis/pc_visualization/data_dev \
+  --open
+
+  python random_vs_synthetic_pca_3d_morph_with_thumbnails.py \
+  --thumbnail-url-prefix /home/maria/mariakesa.github.io/thesis/pc_visualization/data_dev \
+  --site-root /home/maria/mariakesa.github.io \
+  --out-dir /home/maria/mariakesa.github.io/thesis/synthetic_pca_morph \
+  --open
